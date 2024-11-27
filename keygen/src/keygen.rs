@@ -259,7 +259,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .value_name("KEYPAIR")
                         .takes_value(true)
                         .help("Filepath or URL to a keypair"),
-                )
+                ),
         )
         .subcommand(
             Command::new("new")
@@ -291,7 +291,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                 .key_generation_common_args()
                 .arg(no_outfile_arg()
                     .conflicts_with_all(&["outfile", "silent"])
-                )
+                ),
         )
         .subcommand(
             Command::new("grind")
@@ -359,7 +359,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                     // Require a seed phrase to avoid generating a keypair
                     // but having no way to get the private key
                     .requires("use_mnemonic")
-                )
+                ),
         )
         .subcommand(
             Command::new("pubkey")
@@ -390,7 +390,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .short('f')
                         .long("force")
                         .help("Overwrite the output file if it exists"),
-                )
+                ),
         )
         .subcommand(
             Command::new("recover")
@@ -423,7 +423,6 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .long(SKIP_SEED_PHRASE_VALIDATION_ARG.long)
                         .help(SKIP_SEED_PHRASE_VALIDATION_ARG.help),
                 ),
-
         )
 }
 
@@ -671,24 +670,19 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                                 total_matches_found += 1;
                                 continue;
                             }
-                            if (!grind_matches_thread_safe[i].starts.is_empty()
-                                && grind_matches_thread_safe[i].ends.is_empty()
-                                && pubkey.starts_with(&grind_matches_thread_safe[i].starts))
-                                || (grind_matches_thread_safe[i].starts.is_empty()
-                                    && !grind_matches_thread_safe[i].ends.is_empty()
-                                    && pubkey.ends_with(&grind_matches_thread_safe[i].ends))
-                                || (!grind_matches_thread_safe[i].starts.is_empty()
-                                    && !grind_matches_thread_safe[i].ends.is_empty()
-                                    && pubkey.starts_with(&grind_matches_thread_safe[i].starts)
-                                    && pubkey.ends_with(&grind_matches_thread_safe[i].ends))
-                            {
+                            let starts_match = grind_matches_thread_safe[i].starts.is_empty()
+                                || pubkey.starts_with(&grind_matches_thread_safe[i].starts);
+                            let ends_match = grind_matches_thread_safe[i].ends.is_empty()
+                                || pubkey.ends_with(&grind_matches_thread_safe[i].ends);
+
+                            if starts_match && ends_match {
                                 let _found = found.fetch_add(1, Ordering::Relaxed);
                                 grind_matches_thread_safe[i]
                                     .count
                                     .fetch_sub(1, Ordering::Relaxed);
                                 if !no_outfile {
                                     write_keypair_file(&keypair, &format!("{}.json", keypair.pubkey()))
-                                    .unwrap();
+                                        .unwrap();
                                     println!(
                                         "Wrote keypair to {}",
                                         &format!("{}.json", keypair.pubkey())
