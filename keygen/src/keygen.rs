@@ -100,9 +100,11 @@ fn grind_validator_starts_with(v: &str) -> Result<(), String> {
         return Err(String::from("Expected : between PREFIX and COUNT"));
     }
     let args: Vec<&str> = v.split(':').collect();
-    bs58::decode(&args[0])
-        .into_vec()
-        .map_err(|err| format!("{}: {:?}", args[0], err))?;
+    for prefix in args[0].split(',') {
+        bs58::decode(prefix)
+            .into_vec()
+            .map_err(|err| format!("{}: {:?}", prefix, err))?;
+    }
     let count = args[1].parse::<u64>();
     if count.is_err() || count.unwrap() == 0 {
         return Err(String::from("Expected COUNT to be of type u64"));
@@ -115,9 +117,11 @@ fn grind_validator_ends_with(v: &str) -> Result<(), String> {
         return Err(String::from("Expected : between SUFFIX and COUNT"));
     }
     let args: Vec<&str> = v.split(':').collect();
-    bs58::decode(&args[0])
-        .into_vec()
-        .map_err(|err| format!("{}: {:?}", args[0], err))?;
+    for suffix in args[0].split(',') {
+        bs58::decode(suffix)
+            .into_vec()
+            .map_err(|err| format!("{}: {:?}", suffix, err))?;
+    }
     let count = args[1].parse::<u64>();
     if count.is_err() || count.unwrap() == 0 {
         return Err(String::from("Expected COUNT to be of type u64"));
@@ -128,16 +132,20 @@ fn grind_validator_ends_with(v: &str) -> Result<(), String> {
 fn grind_validator_starts_and_ends_with(v: &str) -> Result<(), String> {
     if v.matches(':').count() != 2 || (v.starts_with(':') || v.ends_with(':')) {
         return Err(String::from(
-            "Expected : between PREFIX and SUFFIX and COUNT",
+            "Expected : between PREFIX,SUFFIX and COUNT",
         ));
     }
     let args: Vec<&str> = v.split(':').collect();
-    bs58::decode(&args[0])
-        .into_vec()
-        .map_err(|err| format!("{}: {:?}", args[0], err))?;
-    bs58::decode(&args[1])
-        .into_vec()
-        .map_err(|err| format!("{}: {:?}", args[1], err))?;
+    for prefix in args[0].split(',') {
+        bs58::decode(prefix)
+            .into_vec()
+            .map_err(|err| format!("{}: {:?}", prefix, err))?;
+    }
+    for suffix in args[1].split(',') {
+        bs58::decode(suffix)
+            .into_vec()
+            .map_err(|err| format!("{}: {:?}", suffix, err))?;
+    }
     let count = args[2].parse::<u64>();
     if count.is_err() || count.unwrap() == 0 {
         return Err(String::from("Expected COUNT to be a u64"));
@@ -163,9 +171,9 @@ fn grind_print_info(grind_matches: &[GrindMatch], num_threads: usize) {
             gm.count.load(Ordering::Relaxed),
             msg[0],
             msg[1],
-            gm.starts.join(", "),
+            gm.starts.join(","),
             msg[2],
-            gm.ends.join(", ")
+            gm.ends.join(",")
         );
     }
 }
@@ -178,46 +186,54 @@ fn grind_parse_args(
     num_threads: usize,
 ) -> Vec<GrindMatch> {
     let mut grind_matches = Vec::<GrindMatch>::new();
+
     for sw in starts_with_args {
         let args: Vec<&str> = sw.split(':').collect();
+        let prefixes: Vec<String> = if ignore_case {
+            args[0].split(',').map(|s| s.to_lowercase()).collect()
+        } else {
+            args[0].split(',').map(|s| s.to_string()).collect()
+        };
         grind_matches.push(GrindMatch {
-            starts: if ignore_case {
-                vec![args[0].to_lowercase()]
-            } else {
-                vec![args[0].to_string()]
-            },
+            starts: prefixes,
             ends: vec![],
             count: AtomicU64::new(args[1].parse::<u64>().unwrap()),
         });
     }
+
     for ew in ends_with_args {
         let args: Vec<&str> = ew.split(':').collect();
+        let suffixes: Vec<String> = if ignore_case {
+            args[0].split(',').map(|s| s.to_lowercase()).collect()
+        } else {
+            args[0].split(',').map(|s| s.to_string()).collect()
+        };
         grind_matches.push(GrindMatch {
             starts: vec![],
-            ends: if ignore_case {
-                vec![args[0].to_lowercase()]
-            } else {
-                vec![args[0].to_string()]
-            },
+            ends: suffixes,
             count: AtomicU64::new(args[1].parse::<u64>().unwrap()),
         });
     }
+
     for swew in starts_and_ends_with_args {
         let args: Vec<&str> = swew.split(':').collect();
+        let prefixes: Vec<String> = if ignore_case {
+            args[0].split(',').map(|s| s.to_lowercase()).collect()
+        } else {
+            args[0].split(',').map(|s| s.to_string()).collect()
+        };
+        let suffixes: Vec<String> = if ignore_case {
+            args[1].split(',').map(|s| s.to_lowercase()).collect()
+        } else {
+            args[1].split(',').map(|s| s.to_string()).collect()
+        };
         grind_matches.push(GrindMatch {
-            starts: if ignore_case {
-                args[0].split(',').map(String::from).collect()
-            } else {
-                args[0].split(',').map(String::from).collect()
-            },
-            ends: if ignore_case {
-                args[1].split(',').map(String::from).collect()
-            } else {
-                args[1].split(',').map(String::from).collect()
-            },
+            starts: prefixes,
+            ends: suffixes,
             count: AtomicU64::new(args[2].parse::<u64>().unwrap()),
         });
     }
+
     grind_print_info(&grind_matches, num_threads);
     grind_matches
 }
@@ -311,7 +327,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .multiple_occurrences(true)
                         .multiple_values(true)
                         .validator(grind_validator_starts_with)
-                        .help("Saves specified number of keypairs whos public key starts with the indicated prefix\nExample: --starts-with sol:4\nPREFIX type is Base58\nCOUNT type is u64"),
+                        .help("Saves specified number of keypairs whose public key starts with the indicated prefix\nExample: --starts-with sol:4\nPREFIX type is Base58\nCOUNT type is u64"),
                 )
                 .arg(
                     Arg::new("ends_with")
@@ -322,7 +338,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .multiple_occurrences(true)
                         .multiple_values(true)
                         .validator(grind_validator_ends_with)
-                        .help("Saves specified number of keypairs whos public key ends with the indicated suffix\nExample: --ends-with ana:4\nSUFFIX type is Base58\nCOUNT type is u64"),
+                        .help("Saves specified number of keypairs whose public key ends with the indicated suffix\nExample: --ends-with ana:4\nSUFFIX type is Base58\nCOUNT type is u64"),
                 )
                 .arg(
                     Arg::new("starts_and_ends_with")
@@ -333,7 +349,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .multiple_occurrences(true)
                         .multiple_values(true)
                         .validator(grind_validator_starts_and_ends_with)
-                        .help("Saves specified number of keypairs whos public key starts and ends with the indicated prefix and suffix\nExample: --starts-and-ends-with BO,B0:E,3:4\nPREFIX and SUFFIX type is Base58\nCOUNT type is u64"),
+                        .help("Saves specified number of keypairs whose public key starts and ends with the indicated prefix and suffix\nExample: --starts-and-ends-with 3o,Bo:E,3:1\nPREFIX and SUFFIX type is Base58\nCOUNT type is u64"),
                 )
                 .arg(
                     Arg::new("num_threads")
@@ -605,12 +621,12 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                 .iter()
                 .map(|g| {
                     let target_key = if ignore_case {
-                        g.starts[0].to_ascii_uppercase()
+                        g.starts.first().cloned().unwrap_or_default().to_ascii_uppercase()
                     } else {
-                        g.starts[0].clone()
+                        g.starts.first().cloned().unwrap_or_default()
                     };
                     let target_key =
-                        target_key + &(0..44 - g.starts[0].len()).map(|_| "1").collect::<String>();
+                        target_key + &(0..44 - target_key.len()).map(|_| "1").collect::<String>();
                     bs58::decode(target_key).into_vec()
                 })
                 .filter_map(|s| s.ok())
@@ -670,16 +686,25 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                                 total_matches_found += 1;
                                 continue;
                             }
+                            let starts_match = grind_matches_thread_safe[i]
+                                .starts
+                                .iter()
+                                .any(|s| pubkey.starts_with(s));
+                            let ends_match = grind_matches_thread_safe[i]
+                                .ends
+                                .iter()
+                                .any(|e| pubkey.ends_with(e));
+
                             if (!grind_matches_thread_safe[i].starts.is_empty()
                                 && grind_matches_thread_safe[i].ends.is_empty()
-                                && grind_matches_thread_safe[i].starts.iter().any(|s| pubkey.starts_with(s)))
+                                && starts_match)
                                 || (grind_matches_thread_safe[i].starts.is_empty()
                                     && !grind_matches_thread_safe[i].ends.is_empty()
-                                    && grind_matches_thread_safe[i].ends.iter().any(|e| pubkey.ends_with(e)))
+                                    && ends_match)
                                 || (!grind_matches_thread_safe[i].starts.is_empty()
                                     && !grind_matches_thread_safe[i].ends.is_empty()
-                                    && grind_matches_thread_safe[i].starts.iter().any(|s| pubkey.starts_with(s))
-                                    && grind_matches_thread_safe[i].ends.iter().any(|e| pubkey.ends_with(e)))
+                                    && starts_match
+                                    && ends_match)
                             {
                                 let _found = found.fetch_add(1, Ordering::Relaxed);
                                 grind_matches_thread_safe[i]
