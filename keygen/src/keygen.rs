@@ -58,8 +58,8 @@ mod smallest_length_44_public_key {
 }
 
 struct GrindMatch {
-    starts: HashSet<String>,
-    ends: HashSet<String>,
+    starts: Vec<String>,
+    ends: Vec<String>,
     count: AtomicU64,
 }
 
@@ -100,11 +100,9 @@ fn grind_validator_starts_with(v: &str) -> Result<(), String> {
         return Err(String::from("Expected : between PREFIX and COUNT"));
     }
     let args: Vec<&str> = v.split(':').collect();
-    for prefix in args[0].split(',') {
-        bs58::decode(prefix)
-            .into_vec()
-            .map_err(|err| format!("{}: {:?}", prefix, err))?;
-    }
+    bs58::decode(&args[0])
+        .into_vec()
+        .map_err(|err| format!("{}: {:?}", args[0], err))?;
     let count = args[1].parse::<u64>();
     if count.is_err() || count.unwrap() == 0 {
         return Err(String::from("Expected COUNT to be of type u64"));
@@ -117,11 +115,9 @@ fn grind_validator_ends_with(v: &str) -> Result<(), String> {
         return Err(String::from("Expected : between SUFFIX and COUNT"));
     }
     let args: Vec<&str> = v.split(':').collect();
-    for suffix in args[0].split(',') {
-        bs58::decode(suffix)
-            .into_vec()
-            .map_err(|err| format!("{}: {:?}", suffix, err))?;
-    }
+    bs58::decode(&args[0])
+        .into_vec()
+        .map_err(|err| format!("{}: {:?}", args[0], err))?;
     let count = args[1].parse::<u64>();
     if count.is_err() || count.unwrap() == 0 {
         return Err(String::from("Expected COUNT to be of type u64"));
@@ -136,16 +132,12 @@ fn grind_validator_starts_and_ends_with(v: &str) -> Result<(), String> {
         ));
     }
     let args: Vec<&str> = v.split(':').collect();
-    for prefix in args[0].split(',') {
-        bs58::decode(prefix)
-            .into_vec()
-            .map_err(|err| format!("{}: {:?}", prefix, err))?;
-    }
-    for suffix in args[1].split(',') {
-        bs58::decode(suffix)
-            .into_vec()
-            .map_err(|err| format!("{}: {:?}", suffix, err))?;
-    }
+    bs58::decode(&args[0])
+        .into_vec()
+        .map_err(|err| format!("{}: {:?}", args[0], err))?;
+    bs58::decode(&args[1])
+        .into_vec()
+        .map_err(|err| format!("{}: {:?}", args[1], err))?;
     let count = args[2].parse::<u64>();
     if count.is_err() || count.unwrap() == 0 {
         return Err(String::from("Expected COUNT to be a u64"));
@@ -166,16 +158,14 @@ fn grind_print_info(grind_matches: &[GrindMatch], num_threads: usize) {
             msg.push("starts".to_string());
             msg.push("ends".to_string());
         }
-        let starts = gm.starts.iter().cloned().collect::<Vec<String>>().join(", ");
-        let ends = gm.ends.iter().cloned().collect::<Vec<String>>().join(", ");
         println!(
             "\t{} {} that {} with '{}' and {} with '{}'",
             gm.count.load(Ordering::Relaxed),
             msg[0],
             msg[1],
-            starts,
+            gm.starts.join(", "),
             msg[2],
-            ends
+            gm.ends.join(", ")
         );
     }
 }
@@ -190,57 +180,41 @@ fn grind_parse_args(
     let mut grind_matches = Vec::<GrindMatch>::new();
     for sw in starts_with_args {
         let args: Vec<&str> = sw.split(':').collect();
-        let starts: HashSet<String> = if ignore_case {
-            args[0]
-                .split(',')
-                .map(|s| s.to_lowercase())
-                .collect()
-        } else {
-            args[0].split(',').map(String::from).collect()
-        };
         grind_matches.push(GrindMatch {
-            starts,
-            ends: HashSet::new(),
+            starts: if ignore_case {
+                vec![args[0].to_lowercase()]
+            } else {
+                vec![args[0].to_string()]
+            },
+            ends: vec![],
             count: AtomicU64::new(args[1].parse::<u64>().unwrap()),
         });
     }
     for ew in ends_with_args {
         let args: Vec<&str> = ew.split(':').collect();
-        let ends: HashSet<String> = if ignore_case {
-            args[0]
-                .split(',')
-                .map(|s| s.to_lowercase())
-                .collect()
-        } else {
-            args[0].split(',').map(String::from).collect()
-        };
         grind_matches.push(GrindMatch {
-            starts: HashSet::new(),
-            ends,
+            starts: vec![],
+            ends: if ignore_case {
+                vec![args[0].to_lowercase()]
+            } else {
+                vec![args[0].to_string()]
+            },
             count: AtomicU64::new(args[1].parse::<u64>().unwrap()),
         });
     }
     for swew in starts_and_ends_with_args {
         let args: Vec<&str> = swew.split(':').collect();
-        let starts: HashSet<String> = if ignore_case {
-            args[0]
-                .split(',')
-                .map(|s| s.to_lowercase())
-                .collect()
-        } else {
-            args[0].split(',').map(String::from).collect()
-        };
-        let ends: HashSet<String> = if ignore_case {
-            args[1]
-                .split(',')
-                .map(|s| s.to_lowercase())
-                .collect()
-        } else {
-            args[1].split(',').map(String::from).collect()
-        };
         grind_matches.push(GrindMatch {
-            starts,
-            ends,
+            starts: if ignore_case {
+                args[0].split(',').map(String::from).collect()
+            } else {
+                args[0].split(',').map(String::from).collect()
+            },
+            ends: if ignore_case {
+                args[1].split(',').map(String::from).collect()
+            } else {
+                args[1].split(',').map(String::from).collect()
+            },
             count: AtomicU64::new(args[2].parse::<u64>().unwrap()),
         });
     }
@@ -285,7 +259,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .value_name("KEYPAIR")
                         .takes_value(true)
                         .help("Filepath or URL to a keypair"),
-                ),
+                )
         )
         .subcommand(
             Command::new("new")
@@ -311,9 +285,13 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .long("silent")
                         .help("Do not display seed phrase. Useful when piping output to other programs that prompt for user input, like gpg"),
                 )
-                .arg(derivation_path_arg())
+                .arg(
+                    derivation_path_arg()
+                )
                 .key_generation_common_args()
-                .arg(no_outfile_arg().conflicts_with_all(&["outfile", "silent"])),
+                .arg(no_outfile_arg()
+                    .conflicts_with_all(&["outfile", "silent"])
+                )
         )
         .subcommand(
             Command::new("grind")
@@ -333,7 +311,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .multiple_occurrences(true)
                         .multiple_values(true)
                         .validator(grind_validator_starts_with)
-                        .help("Saves specified number of keypairs whose public key starts with the indicated prefix\nExample: --starts-with sol:4\nPREFIX type is Base58\nCOUNT type is u64"),
+                        .help("Saves specified number of keypairs whos public key starts with the indicated prefix\nExample: --starts-with sol:4\nPREFIX type is Base58\nCOUNT type is u64"),
                 )
                 .arg(
                     Arg::new("ends_with")
@@ -344,18 +322,18 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .multiple_occurrences(true)
                         .multiple_values(true)
                         .validator(grind_validator_ends_with)
-                        .help("Saves specified number of keypairs whose public key ends with the indicated suffix\nExample: --ends-with ana:4\nSUFFIX type is Base58\nCOUNT type is u64"),
+                        .help("Saves specified number of keypairs whos public key ends with the indicated suffix\nExample: --ends-with ana:4\nSUFFIX type is Base58\nCOUNT type is u64"),
                 )
                 .arg(
                     Arg::new("starts_and_ends_with")
                         .long("starts-and-ends-with")
-                        .value_name("PREFIX:SUFFIX:COUNT")
+                        .value_name("PREFIX,SUFFIX:COUNT")
                         .number_of_values(1)
                         .takes_value(true)
                         .multiple_occurrences(true)
                         .multiple_values(true)
                         .validator(grind_validator_starts_and_ends_with)
-                        .help("Saves specified number of keypairs whose public key starts and ends with the indicated prefix and suffix\nExample: --starts-and-ends-with sol:ana:4\nPREFIX and SUFFIX type is Base58\nCOUNT type is u64"),
+                        .help("Saves specified number of keypairs whos public key starts and ends with the indicated prefix and suffix\nExample: --starts-and-ends-with BO,B0:E,3:4\nPREFIX and SUFFIX type is Base58\nCOUNT type is u64"),
                 )
                 .arg(
                     Arg::new("num_threads")
@@ -369,18 +347,19 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                 .arg(
                     Arg::new("use_mnemonic")
                         .long("use-mnemonic")
-                        .help("Generate using a mnemonic key phrase. Expect a significant slowdown in this mode"),
+                        .help("Generate using a mnemonic key phrase.  Expect a significant slowdown in this mode"),
                 )
                 .arg(
-                    derivation_path_arg().requires("use_mnemonic"),
+                    derivation_path_arg()
+                        .requires("use_mnemonic")
                 )
                 .key_generation_common_args()
                 .arg(
                     no_outfile_arg()
-                        // Require a seed phrase to avoid generating a keypair
-                        // but having no way to get the private key
-                        .requires("use_mnemonic"),
-                ),
+                    // Require a seed phrase to avoid generating a keypair
+                    // but having no way to get the private key
+                    .requires("use_mnemonic")
+                )
         )
         .subcommand(
             Command::new("pubkey")
@@ -411,7 +390,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .short('f')
                         .long("force")
                         .help("Overwrite the output file if it exists"),
-                ),
+                )
         )
         .subcommand(
             Command::new("recover")
@@ -589,7 +568,7 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                 && starts_and_ends_with_args.is_empty()
             {
                 return Err(
-                    "Error: No keypair search criteria provided (--starts-with or --ends-with or --starts-and-ends-with)".into(),
+                    "Error: No keypair search criteria provided (--starts-with or --ends-with or --starts-and-ends-with)".into()
                 );
             }
 
@@ -619,19 +598,19 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
             let no_outfile = matches.is_present(NO_OUTFILE_ARG.name);
 
             // The vast majority of base58 encoded public keys have length 44, but
-            // these only encapsulate prefixes 1-9 and A-H. If the user is searching
+            // these only encapsulate prefixes 1-9 and A-H.  If the user is searching
             // for a keypair that starts with a prefix of J-Z or a-z, then there is no
             // reason to waste time searching for a keypair that will never match
             let skip_len_44_pubkeys = grind_matches
                 .iter()
                 .map(|g| {
                     let target_key = if ignore_case {
-                        g.starts.iter().cloned().collect::<Vec<String>>()[0].to_ascii_uppercase()
+                        g.starts[0].to_ascii_uppercase()
                     } else {
-                        g.starts.iter().cloned().collect::<Vec<String>>()[0]
+                        g.starts[0].clone()
                     };
                     let target_key =
-                        target_key + &(0..44 - target_key.len()).map(|_| "1").collect::<String>();
+                        target_key + &(0..44 - g.starts[0].len()).map(|_| "1").collect::<String>();
                     bs58::decode(target_key).into_vec()
                 })
                 .filter_map(|s| s.ok())
@@ -693,26 +672,14 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                             }
                             if (!grind_matches_thread_safe[i].starts.is_empty()
                                 && grind_matches_thread_safe[i].ends.is_empty()
-                                && grind_matches_thread_safe[i]
-                                    .starts
-                                    .iter()
-                                    .any(|start| pubkey.starts_with(start)))
+                                && grind_matches_thread_safe[i].starts.iter().any(|s| pubkey.starts_with(s)))
                                 || (grind_matches_thread_safe[i].starts.is_empty()
                                     && !grind_matches_thread_safe[i].ends.is_empty()
-                                    && grind_matches_thread_safe[i]
-                                        .ends
-                                        .iter()
-                                        .any(|end| pubkey.ends_with(end)))
+                                    && grind_matches_thread_safe[i].ends.iter().any(|e| pubkey.ends_with(e)))
                                 || (!grind_matches_thread_safe[i].starts.is_empty()
                                     && !grind_matches_thread_safe[i].ends.is_empty()
-                                    && grind_matches_thread_safe[i]
-                                        .starts
-                                        .iter()
-                                        .any(|start| pubkey.starts_with(start))
-                                    && grind_matches_thread_safe[i]
-                                        .ends
-                                        .iter()
-                                        .any(|end| pubkey.ends_with(end)))
+                                    && grind_matches_thread_safe[i].starts.iter().any(|s| pubkey.starts_with(s))
+                                    && grind_matches_thread_safe[i].ends.iter().any(|e| pubkey.ends_with(e)))
                             {
                                 let _found = found.fetch_add(1, Ordering::Relaxed);
                                 grind_matches_thread_safe[i]
@@ -720,7 +687,7 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                                     .fetch_sub(1, Ordering::Relaxed);
                                 if !no_outfile {
                                     write_keypair_file(&keypair, &format!("{}.json", keypair.pubkey()))
-                                        .unwrap();
+                                    .unwrap();
                                     println!(
                                         "Wrote keypair to {}",
                                         &format!("{}.json", keypair.pubkey())
@@ -730,8 +697,7 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                                     let divider = String::from_utf8(vec![b'='; phrase.len()]).unwrap();
                                     println!(
                                         "{}\nFound matching key {}",
-                                        &divider, keypair.pubkey()
-                                    );
+                                        &divider, keypair.pubkey());
                                     println!(
                                         "\nSave this seed phrase{} to recover your new keypair:\n{}\n{}",
                                         passphrase_message, phrase, &divider
@@ -775,18 +741,6 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
     }
 
     Ok(())
-}
-
-mod smallest_length_44_public_key {
-    use solana_sdk::{pubkey, pubkey::Pubkey};
-
-    pub(super) static PUBKEY: Pubkey = pubkey!("21111111111111111111111111111111111111111111");
-
-    #[test]
-    fn assert_length() {
-        use crate::smallest_length_44_public_key;
-        assert_eq!(smallest_length_44_public_key::PUBKEY.to_string().len(), 44);
-    }
 }
 
 #[cfg(test)]
