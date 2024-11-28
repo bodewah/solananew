@@ -1,5 +1,236 @@
-use clap::{value_parser, Arg, ArgMatches, Command};
-use std::collections::HashSet;
+#![allow(clippy::arithmetic_side_effects)]
+#![allow(deprecated)]
+use {
+    bip39::{Mnemonic, MnemonicType, Seed},
+    clap::{crate_description, crate_name, value_parser, Arg, ArgMatches, Command},
+    solana_clap_v3_utils::{
+        input_parsers::STDOUT_OUTFILE_TOKEN,
+        input_validators::is_prompt_signer_source,
+        keygen::{
+            check_for_overwrite,
+            derivation_path::{acquire_derivation_path, derivation_path_arg},
+            mnemonic::{
+                acquire_language, acquire_passphrase_and_message, no_passphrase_and_message,
+                WORD_COUNT_ARG,
+            },
+            no_outfile_arg, KeyGenerationCommonArgs, NO_OUTFILE_ARG,
+        },
+    },
+    solana_cli_config::Config,
+    solana_remote_wallet::remote_wallet::RemoteWalletManager,
+    solana_sdk::{
+        instruction::{AccountMeta, Instruction},
+        message::Message,
+        pubkey::{write_pubkey_file, Pubkey},
+        signature::{
+            keypair_from_seed, keypair_from_seed_and_derivation_path, write_keypair,
+            write_keypair_file, Keypair, Signer,
+        },
+    },
+    std::{
+        collections::HashSet,
+        error,
+        rc::Rc,
+        sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc,
+        },
+        thread,
+        time::Instant,
+    },
+};
+
+mod smallest_length_44_public_key {
+    use solana_sdk::{pubkey, pubkey::Pubkey};
+
+    pub(super) static PUBKEY: Pubkey = pubkey!("21111111111111111111111111111111111111111111");
+
+    #[test]
+    fn assert_length() {
+        use crate::smallest_length_44_public_key;
+        assert_eq!(smallest_length_44_public_key::PUBKEY.to_string().len(), 44);
+    }
+}
+
+struct GrindMatch {
+    starts: String,
+    ends: String,
+    count: AtomicU64,
+}
+
+fn get_keypair_from_matches(
+    matches: &ArgMatches,
+    config: Config,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
+) -> Result<Box<dyn Signer>, Box<dyn error::Error>> {
+    let mut path = dirs_next::home_dir().expect("home directory");
+    let path = if matches.is_present("keypair") {
+        matches.value_of("keypair").unwrap()
+    } else if !config.keypair_path.is_empty() {
+        &config.keypair_path
+    } else {
+        path.extend([".config", "solana", "id.json"]);
+        path.to_str().unwrap()
+    };
+    signer_from_path(matches, path, "pubkey recovery", wallet_manager)
+}
+
+fn output_keypair(
+    keypair: &Keypair,
+    outfile: &str,
+    source: &str,
+) -> Result<(), Box<dyn error::Error>> {
+    if outfile == STDOUT_OUTFILE_TOKEN {
+        let mut stdout = std::io::stdout();
+        write_keypair(keypair, &mut stdout)?;
+    } else {
+        write_keypair_file(keypair, outfile)?;
+        println!("Wrote {source} keypair to {outfile}");
+    }
+    Ok(())
+}
+
+fn grind_validator_starts_with(v: &str) -> Result<(), String> {
+    if v.matches(':').count() != 1 || (v.starts_with(':') || v.ends_with(':')) {
+        return Err(String::from("Expected : between PREFIX and COUNT"));
+    }
+    let args: Vec<&str> = v.split(':').collect();
+    bs58::decode(&args[0])
+        .into_vec()
+        .map_err(|err| format!("{}: {:?}", args[0], err))?;
+    let count = args[1].parse::<u64>();
+    if count.is_err() || count.unwrap() == 0 {
+        return Err(String::from("Expected COUNT to be of type u64"));
+    }
+    Ok(())
+}
+
+fn grind_validator_ends_with(v: &str) -> Result<(), String> {
+    if v.matches(':').count() != 1 || (v.starts_with(':') || v.ends_with(':')) {
+        return Err(String::from("Expected : between SUFFIX and COUNT"));
+    }
+    let args: Vec<&str> = v.split(':').collect();
+    bs58::decode(&args[0])
+        .into_vec()
+        .map_err(|err| format!("{}: {:?}", args[0], err))?;
+    let count = args[1].parse::<u64>();
+    if count.is_err() || count.unwrap() == 0 {
+        return Err(String::from("Expected COUNT to be of type u64"));
+    }
+    Ok(())
+}
+
+fn grind_validator_starts_and_ends_with(v: &str) -> Result<(), String> {
+    let args: Vec<&str> = v.split(':').collect();
+    if args.len() != 3 || (v.starts_with(':') || v.ends_with(':')) {
+        return Err(String::from(
+            "Expected : between PREFIX and SUFFIX and COUNT",
+        ));
+    }
+    let starts_vec: Vec<&str> = args[0].split(',').collect();
+    let ends_vec: Vec<&str> = args[1].split(',').collect();
+
+    for start in &starts_vec {
+        bs58::decode(start)
+            .into_vec()
+            .map_err(|err| format!("{}: {:?}", start, err))?;
+    }
+
+    for end in &ends_vec {
+        bs58::decode(end)
+            .into_vec()
+            .map_err(|err| format!("{}: {:?}", end, err))?;
+    }
+
+    let count = args[2].parse::<u64>();
+    if count.is_err() || count.unwrap() == 0 {
+        return Err(String::from("Expected COUNT to be a u64"));
+    }
+    Ok(())
+}
+
+fn grind_print_info(grind_matches: &[GrindMatch], num_threads: usize) {
+    println!("Searching with {num_threads} threads for:");
+    for gm in grind_matches {
+        let mut msg = Vec::<String>::new();
+        if gm.count.load(Ordering::Relaxed) > 1 {
+            msg.push("pubkeys".to_string());
+            msg.push("start".to_string());
+            msg.push("end".to_string());
+        } else {
+            msg.push("pubkey".to_string());
+            msg.push("starts".to_string());
+            msg.push("ends".to_string());
+        }
+        println!(
+            "\t{} {} that {} with '{}' and {} with '{}'",
+            gm.count.load(Ordering::Relaxed),
+            msg[0],
+            msg[1],
+            gm.starts,
+            msg[2],
+            gm.ends
+        );
+    }
+}
+
+fn grind_parse_args(
+    ignore_case: bool,
+    starts_with_args: HashSet<String>,
+    ends_with_args: HashSet<String>,
+    starts_and_ends_with_args: HashSet<String>,
+    num_threads: usize,
+) -> Vec<GrindMatch> {
+    let mut grind_matches = Vec::<GrindMatch>::new();
+    for sw in starts_with_args {
+        let args: Vec<&str> = sw.split(':').collect();
+        grind_matches.push(GrindMatch {
+            starts: if ignore_case {
+                args[0].to_lowercase()
+            } else {
+                args[0].to_string()
+            },
+            ends: "".to_string(),
+            count: AtomicU64::new(args[1].parse::<u64>().unwrap()),
+        });
+    }
+    for ew in ends_with_args {
+        let args: Vec<&str> = ew.split(':').collect();
+        grind_matches.push(GrindMatch {
+            starts: "".to_string(),
+            ends: if ignore_case {
+                args[0].to_lowercase()
+            } else {
+                args[0].to_string()
+            },
+            count: AtomicU64::new(args[1].parse::<u64>().unwrap()),
+        });
+    }
+    for swew in starts_and_ends_with_args {
+        let args: Vec<&str> = swew.split(':').collect();
+        let starts_vec: Vec<&str> = args[0].split(',').collect();
+        let ends_vec: Vec<&str> = args[1].split(',').collect();
+        for start in &starts_vec {
+            for end in &ends_vec {
+                grind_matches.push(GrindMatch {
+                    starts: if ignore_case {
+                        start.to_lowercase()
+                    } else {
+                        start.to_string()
+                    },
+                    ends: if ignore_case {
+                        end.to_lowercase()
+                    } else {
+                        end.to_string()
+                    },
+                    count: AtomicU64::new(args[2].parse::<u64>().unwrap()),
+                });
+            }
+        }
+    }
+    grind_print_info(&grind_matches, num_threads);
+    grind_matches
+}
 
 fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
     Command::new(crate_name!())
@@ -38,7 +269,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .value_name("KEYPAIR")
                         .takes_value(true)
                         .help("Filepath or URL to a keypair"),
-                )
+                ),
         )
         .subcommand(
             Command::new("new")
@@ -82,15 +313,37 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .help("Performs case insensitive matches"),
                 )
                 .arg(
+                    Arg::new("starts_with")
+                        .long("starts-with")
+                        .value_name("PREFIX:COUNT")
+                        .number_of_values(1)
+                        .takes_value(true)
+                        .multiple_occurrences(true)
+                        .multiple_values(true)
+                        .validator(grind_validator_starts_with)
+                        .help("Saves specified number of keypairs whos public key starts with the indicated prefix\nExample: --starts-with sol:4\nPREFIX type is Base58\nCOUNT type is u64"),
+                )
+                .arg(
+                    Arg::new("ends_with")
+                        .long("ends-with")
+                        .value_name("SUFFIX:COUNT")
+                        .number_of_values(1)
+                        .takes_value(true)
+                        .multiple_occurrences(true)
+                        .multiple_values(true)
+                        .validator(grind_validator_ends_with)
+                        .help("Saves specified number of keypairs whos public key ends with the indicated suffix\nExample: --ends-with ana:4\nSUFFIX type is Base58\nCOUNT type is u64"),
+                )
+                .arg(
                     Arg::new("starts_and_ends_with")
                         .long("starts-and-ends-with")
-                        .value_name("PREFIX:SUFFIX:COUNT")
+                        .value_name("PREFIX,SUFFIX:COUNT")
                         .number_of_values(1)
                         .takes_value(true)
                         .multiple_occurrences(true)
                         .multiple_values(true)
                         .validator(grind_validator_starts_and_ends_with)
-                        .help("Saves specified number of keypairs whose public key starts and ends with the indicated prefix and suffix\nExample: --starts-and-ends-with sol:ana:4\nPREFIX and SUFFIX type is Base58\nCOUNT type is u64"),
+                        .help("Saves specified number of keypairs whos public key starts and ends with the indicated perfix and suffix\nExample: --starts-and-ends-with BO,B0:E,3:4\nPREFIX and SUFFIX type is Base58\nCOUNT type is u64"),
                 )
                 .arg(
                     Arg::new("num_threads")
@@ -104,7 +357,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                 .arg(
                     Arg::new("use_mnemonic")
                         .long("use-mnemonic")
-                        .help("Generate using a mnemonic key phrase. Expect a significant slowdown in this mode"),
+                        .help("Generate using a mnemonic key phrase.  Expect a significant slowdown in this mode"),
                 )
                 .arg(
                     derivation_path_arg()
@@ -116,7 +369,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                     // Require a seed phrase to avoid generating a keypair
                     // but having no way to get the private key
                     .requires("use_mnemonic")
-                )
+                ),
         )
         .subcommand(
             Command::new("pubkey")
@@ -147,7 +400,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .short('f')
                         .long("force")
                         .help("Overwrite the output file if it exists"),
-                )
+                ),
         )
         .subcommand(
             Command::new("recover")
@@ -181,32 +434,6 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .help(SKIP_SEED_PHRASE_VALIDATION_ARG.help),
                 ),
         )
-}
-
-fn grind_parse_args(
-    ignore_case: bool,
-    starts_and_ends_with_args: HashSet<String>,
-    num_threads: usize,
-) -> Vec<GrindMatch> {
-    let mut grind_matches = Vec::<GrindMatch>::new();
-    for swew in starts_and_ends_with_args {
-        let args: Vec<&str> = swew.split(':').collect();
-        grind_matches.push(GrindMatch {
-            starts: if ignore_case {
-                args[0].to_lowercase()
-            } else {
-                args[0].to_string()
-            },
-            ends: if ignore_case {
-                args[1].to_lowercase()
-            } else {
-                args[1].to_string()
-            },
-            count: AtomicU64::new(args[2].parse::<u64>().unwrap()),
-        });
-    }
-    grind_print_info(&grind_matches, num_threads);
-    grind_matches
 }
 
 fn main() -> Result<(), Box<dyn error::Error>> {
@@ -318,6 +545,24 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
         ("grind", matches) => {
             let ignore_case = matches.is_present("ignore_case");
 
+            let starts_with_args = if matches.is_present("starts_with") {
+                matches
+                    .values_of_t_or_exit::<String>("starts_with")
+                    .into_iter()
+                    .map(|s| if ignore_case { s.to_lowercase() } else { s })
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            let ends_with_args = if matches.is_present("ends_with") {
+                matches
+                    .values_of_t_or_exit::<String>("ends_with")
+                    .into_iter()
+                    .map(|s| if ignore_case { s.to_lowercase() } else { s })
+                    .collect()
+            } else {
+                HashSet::new()
+            };
             let starts_and_ends_with_args = if matches.is_present("starts_and_ends_with") {
                 matches
                     .values_of_t_or_exit::<String>("starts_and_ends_with")
@@ -328,9 +573,12 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                 HashSet::new()
             };
 
-            if starts_and_ends_with_args.is_empty() {
+            if starts_with_args.is_empty()
+                && ends_with_args.is_empty()
+                && starts_and_ends_with_args.is_empty()
+            {
                 return Err(
-                    "Error: No keypair search criteria provided (--starts-and-ends-with)".into()
+                    "Error: No keypair search criteria provided (--starts-with or --ends-with or --starts-and-ends-with)".into()
                 );
             }
 
@@ -338,6 +586,8 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
 
             let grind_matches = grind_parse_args(
                 ignore_case,
+                starts_with_args,
+                ends_with_args,
                 starts_and_ends_with_args,
                 num_threads,
             );
@@ -358,7 +608,7 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
             let no_outfile = matches.is_present(NO_OUTFILE_ARG.name);
 
             // The vast majority of base58 encoded public keys have length 44, but
-            // these only encapsulate prefixes 1-9 and A-H. If the user is searching
+            // these only encapsulate prefixes 1-9 and A-H.  If the user is searching
             // for a keypair that starts with a prefix of J-Z or a-z, then there is no
             // reason to waste time searching for a keypair that will never match
             let skip_len_44_pubkeys = grind_matches
@@ -501,4 +751,374 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        tempfile::{tempdir, TempDir},
+    };
+
+    fn process_test_command(args: &[&str]) -> Result<(), Box<dyn error::Error>> {
+        let default_num_threads = num_cpus::get().to_string();
+        let solana_version = solana_version::version!();
+        let app_matches = app(&default_num_threads, solana_version).get_matches_from(args);
+        do_main(&app_matches)
+    }
+
+    fn create_tmp_keypair_and_config_file(
+        keypair_out_dir: &TempDir,
+        config_out_dir: &TempDir,
+    ) -> (Pubkey, String, String) {
+        let keypair = Keypair::new();
+        let keypair_path = keypair_out_dir
+            .path()
+            .join(format!("{}-keypair", keypair.pubkey()));
+        let keypair_outfile = keypair_path.into_os_string().into_string().unwrap();
+        write_keypair_file(&keypair, &keypair_outfile).unwrap();
+
+        let config = Config {
+            keypair_path: keypair_outfile.clone(),
+            ..Config::default()
+        };
+        let config_path = config_out_dir
+            .path()
+            .join(format!("{}-config", keypair.pubkey()));
+        let config_outfile = config_path.into_os_string().into_string().unwrap();
+        config.save(&config_outfile).unwrap();
+
+        (keypair.pubkey(), keypair_outfile, config_outfile)
+    }
+
+    fn tmp_outfile_path(out_dir: &TempDir, name: &str) -> String {
+        let path = out_dir.path().join(name);
+        path.into_os_string().into_string().unwrap()
+    }
+
+    #[test]
+    fn test_arguments() {
+        let default_num_threads = num_cpus::get().to_string();
+        let solana_version = solana_version::version!();
+
+        // run clap internal assert statements
+        app(&default_num_threads, solana_version).debug_assert();
+    }
+
+    #[test]
+    fn test_verify() {
+        let keypair_out_dir = tempdir().unwrap();
+        let config_out_dir = tempdir().unwrap();
+        let (correct_pubkey, keypair_path, config_path) =
+            create_tmp_keypair_and_config_file(&keypair_out_dir, &config_out_dir);
+
+        // success case using a keypair file
+        process_test_command(&[
+            "solana-keygen",
+            "verify",
+            &correct_pubkey.to_string(),
+            &keypair_path,
+        ])
+        .unwrap();
+
+        // success case using a config file
+        process_test_command(&[
+            "solana-keygen",
+            "verify",
+            &correct_pubkey.to_string(),
+            "--config",
+            &config_path,
+        ])
+        .unwrap();
+
+        // fail case using a keypair file
+        let incorrect_pubkey = Pubkey::new_unique();
+        let result = process_test_command(&[
+            "solana-keygen",
+            "verify",
+            &incorrect_pubkey.to_string(),
+            &keypair_path,
+        ])
+        .unwrap_err()
+        .to_string();
+
+        let expected = format!("Verification for public key: {incorrect_pubkey}: Failed");
+        assert_eq!(result, expected);
+
+        // fail case using a config file
+        process_test_command(&[
+            "solana-keygen",
+            "verify",
+            &incorrect_pubkey.to_string(),
+            "--config",
+            &config_path,
+        ])
+        .unwrap_err()
+        .to_string();
+
+        let expected = format!("Verification for public key: {incorrect_pubkey}: Failed");
+        assert_eq!(result, expected);
+
+        // keypair file takes precedence over config file
+        let alt_keypair_out_dir = tempdir().unwrap();
+        let alt_config_out_dir = tempdir().unwrap();
+        let (_, alt_keypair_path, alt_config_path) =
+            create_tmp_keypair_and_config_file(&alt_keypair_out_dir, &alt_config_out_dir);
+
+        process_test_command(&[
+            "solana-keygen",
+            "verify",
+            &correct_pubkey.to_string(),
+            &keypair_path,
+            "--config",
+            &alt_config_path,
+        ])
+        .unwrap();
+
+        process_test_command(&[
+            "solana-keygen",
+            "verify",
+            &correct_pubkey.to_string(),
+            &alt_keypair_path,
+            "--config",
+            &config_path,
+        ])
+        .unwrap_err()
+        .to_string();
+
+        let expected = format!("Verification for public key: {incorrect_pubkey}: Failed");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_pubkey() {
+        let keypair_out_dir = tempdir().unwrap();
+        let config_out_dir = tempdir().unwrap();
+        let (expected_pubkey, keypair_path, config_path) =
+            create_tmp_keypair_and_config_file(&keypair_out_dir, &config_out_dir);
+
+        // success case using a keypair file
+        {
+            let outfile_dir = tempdir().unwrap();
+            let outfile_path = tmp_outfile_path(&outfile_dir, &expected_pubkey.to_string());
+
+            process_test_command(&[
+                "solana-keygen",
+                "pubkey",
+                &keypair_path,
+                "--outfile",
+                &outfile_path,
+            ])
+            .unwrap();
+
+            let result_pubkey = solana_sdk::pubkey::read_pubkey_file(&outfile_path).unwrap();
+            assert_eq!(result_pubkey, expected_pubkey);
+        }
+
+        // success case using a config file
+        {
+            let outfile_dir = tempdir().unwrap();
+            let outfile_path = tmp_outfile_path(&outfile_dir, &expected_pubkey.to_string());
+
+            process_test_command(&[
+                "solana-keygen",
+                "pubkey",
+                "--config",
+                &config_path,
+                "--outfile",
+                &outfile_path,
+            ])
+            .unwrap();
+
+            let result_pubkey = solana_sdk::pubkey::read_pubkey_file(&outfile_path).unwrap();
+            assert_eq!(result_pubkey, expected_pubkey);
+        }
+
+        // keypair file takes precedence over config file
+        {
+            let alt_keypair_out_dir = tempdir().unwrap();
+            let alt_config_out_dir = tempdir().unwrap();
+            let (_, _, alt_config_path) =
+                create_tmp_keypair_and_config_file(&alt_keypair_out_dir, &alt_config_out_dir);
+            let outfile_dir = tempdir().unwrap();
+            let outfile_path = tmp_outfile_path(&outfile_dir, &expected_pubkey.to_string());
+
+            process_test_command(&[
+                "solana-keygen",
+                "pubkey",
+                &keypair_path,
+                "--config",
+                &alt_config_path,
+                "--outfile",
+                &outfile_path,
+            ])
+            .unwrap();
+
+            let result_pubkey = solana_sdk::pubkey::read_pubkey_file(&outfile_path).unwrap();
+            assert_eq!(result_pubkey, expected_pubkey);
+        }
+
+        // refuse to overwrite file
+        {
+            let outfile_dir = tempdir().unwrap();
+            let outfile_path = tmp_outfile_path(&outfile_dir, &expected_pubkey.to_string());
+
+            process_test_command(&[
+                "solana-keygen",
+                "pubkey",
+                &keypair_path,
+                "--outfile",
+                &outfile_path,
+            ])
+            .unwrap();
+
+            let result = process_test_command(&[
+                "solana-keygen",
+                "pubkey",
+                "--config",
+                &config_path,
+                "--outfile",
+                &outfile_path,
+            ])
+            .unwrap_err()
+            .to_string();
+
+            let expected = format!("Refusing to overwrite {outfile_path} without --force flag");
+            assert_eq!(result, expected);
+        }
+    }
+
+    #[test]
+    fn test_new() {
+        let keypair_out_dir = tempdir().unwrap();
+        let config_out_dir = tempdir().unwrap();
+        let (expected_pubkey, _, _) =
+            create_tmp_keypair_and_config_file(&keypair_out_dir, &config_out_dir);
+
+        let outfile_dir = tempdir().unwrap();
+        let outfile_path = tmp_outfile_path(&outfile_dir, &expected_pubkey.to_string());
+
+        // general success case
+        process_test_command(&[
+            "solana-keygen",
+            "new",
+            "--outfile",
+            &outfile_path,
+            "--no-bip39-passphrase",
+        ])
+        .unwrap();
+
+        // refuse to overwrite file
+        let result = process_test_command(&[
+            "solana-keygen",
+            "new",
+            "--outfile",
+            &outfile_path,
+            "--no-bip39-passphrase",
+        ])
+        .unwrap_err()
+        .to_string();
+
+        let expected = format!("Refusing to overwrite {outfile_path} without --force flag");
+        assert_eq!(result, expected);
+
+        // no outfile
+        process_test_command(&[
+            "solana-keygen",
+            "new",
+            "--no-bip39-passphrase",
+            "--no-outfile",
+        ])
+        .unwrap();
+
+        // sanity check on languages and word count combinations
+        let languages = [
+            "english",
+            "chinese-simplified",
+            "chinese-traditional",
+            "japanese",
+            "spanish",
+            "korean",
+            "french",
+            "italian",
+        ];
+        let word_counts = ["12", "15", "18", "21", "24"];
+
+        for language in languages {
+            for word_count in word_counts {
+                process_test_command(&[
+                    "solana-keygen",
+                    "new",
+                    "--no-outfile",
+                    "--no-bip39-passphrase",
+                    "--language",
+                    language,
+                    "--word-count",
+                    word_count,
+                ])
+                .unwrap();
+            }
+        }
+
+        // sanity check derivation path
+        process_test_command(&[
+            "solana-keygen",
+            "new",
+            "--no-bip39-passphrase",
+            "--no-outfile",
+            "--derivation-path",
+            // empty derivation path
+        ])
+        .unwrap();
+
+        process_test_command(&[
+            "solana-keygen",
+            "new",
+            "--no-bip39-passphrase",
+            "--no-outfile",
+            "--derivation-path",
+            "m/44'/501'/0'/0'", // default derivation path
+        ])
+        .unwrap();
+
+        let result = process_test_command(&[
+            "solana-keygen",
+            "new",
+            "--no-bip39-passphrase",
+            "--no-outfile",
+            "--derivation-path",
+            "-", // invalid derivation path
+        ])
+        .unwrap_err()
+        .to_string();
+
+        let expected = "invalid derivation path: invalid prefix: -";
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_grind() {
+        // simple sanity checks
+        process_test_command(&[
+            "solana-keygen",
+            "grind",
+            "--no-outfile",
+            "--no-bip39-passphrase",
+            "--use-mnemonic",
+            "--starts-with",
+            "a:1",
+        ])
+        .unwrap();
+
+        process_test_command(&[
+            "solana-keygen",
+            "grind",
+            "--no-outfile",
+            "--no-bip39-passphrase",
+            "--use-mnemonic",
+            "--ends-with",
+            "b:1",
+        ])
+        .unwrap();
+    }
 }
