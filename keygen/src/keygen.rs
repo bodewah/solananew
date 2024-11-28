@@ -444,7 +444,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .long(SKIP_SEED_PHRASE_VALIDATION_ARG.long)
                         .help(SKIP_SEED_PHRASE_VALIDATION_ARG.help),
                 ),
-        ),
+        )
 }
 
 fn main() -> Result<(), Box<dyn error::Error>> {
