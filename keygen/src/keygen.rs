@@ -15,8 +15,13 @@ use {
             },
             no_outfile_arg, KeyGenerationCommonArgs, NO_OUTFILE_ARG,
         },
+        keypair::{
+            keypair_from_path, keypair_from_seed_phrase, signer_from_path,
+            SKIP_SEED_PHRASE_VALIDATION_ARG,
+        },
+        DisplayError,
     },
-    solana_cli_config::Config,
+    solana_cli_config::{Config, CONFIG_FILE},
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_sdk::{
         instruction::{AccountMeta, Instruction},
@@ -53,8 +58,8 @@ mod smallest_length_44_public_key {
 }
 
 struct GrindMatch {
-    starts: String,
-    ends: String,
+    starts: HashSet<String>,
+    ends: HashSet<String>,
     count: AtomicU64,
 }
 
@@ -122,26 +127,23 @@ fn grind_validator_ends_with(v: &str) -> Result<(), String> {
 
 fn grind_validator_starts_and_ends_with(v: &str) -> Result<(), String> {
     let args: Vec<&str> = v.split(':').collect();
-    if args.len() != 3 || (v.starts_with(':') || v.ends_with(':')) {
+    if args.len() != 3 || (args[0].is_empty() || args[1].is_empty() || args[2].is_empty()) {
         return Err(String::from(
             "Expected : between PREFIX and SUFFIX and COUNT",
         ));
     }
-    let starts_vec: Vec<&str> = args[0].split(',').collect();
-    let ends_vec: Vec<&str> = args[1].split(',').collect();
-
-    for start in &starts_vec {
-        bs58::decode(start)
+    let prefixes: Vec<&str> = args[0].split(',').collect();
+    for prefix in &prefixes {
+        bs58::decode(prefix)
             .into_vec()
-            .map_err(|err| format!("{}: {:?}", start, err))?;
+            .map_err(|err| format!("{}: {:?}", prefix, err))?;
     }
-
-    for end in &ends_vec {
-        bs58::decode(end)
+    let suffixes: Vec<&str> = args[1].split(',').collect();
+    for suffix in &suffixes {
+        bs58::decode(suffix)
             .into_vec()
-            .map_err(|err| format!("{}: {:?}", end, err))?;
+            .map_err(|err| format!("{}: {:?}", suffix, err))?;
     }
-
     let count = args[2].parse::<u64>();
     if count.is_err() || count.unwrap() == 0 {
         return Err(String::from("Expected COUNT to be a u64"));
@@ -167,9 +169,9 @@ fn grind_print_info(grind_matches: &[GrindMatch], num_threads: usize) {
             gm.count.load(Ordering::Relaxed),
             msg[0],
             msg[1],
-            gm.starts,
+            gm.starts.iter().cloned().collect::<Vec<String>>().join(", "),
             msg[2],
-            gm.ends
+            gm.ends.iter().cloned().collect::<Vec<String>>().join(", ")
         );
     }
 }
@@ -186,47 +188,49 @@ fn grind_parse_args(
         let args: Vec<&str> = sw.split(':').collect();
         grind_matches.push(GrindMatch {
             starts: if ignore_case {
-                args[0].to_lowercase()
+                HashSet::from([args[0].to_lowercase()])
             } else {
-                args[0].to_string()
+                HashSet::from([args[0].to_string()])
             },
-            ends: "".to_string(),
+            ends: HashSet::new(),
             count: AtomicU64::new(args[1].parse::<u64>().unwrap()),
         });
     }
     for ew in ends_with_args {
         let args: Vec<&str> = ew.split(':').collect();
         grind_matches.push(GrindMatch {
-            starts: "".to_string(),
+            starts: HashSet::new(),
             ends: if ignore_case {
-                args[0].to_lowercase()
+                HashSet::from([args[0].to_lowercase()])
             } else {
-                args[0].to_string()
+                HashSet::from([args[0].to_string()])
             },
             count: AtomicU64::new(args[1].parse::<u64>().unwrap()),
         });
     }
     for swew in starts_and_ends_with_args {
         let args: Vec<&str> = swew.split(':').collect();
-        let starts_vec: Vec<&str> = args[0].split(',').collect();
-        let ends_vec: Vec<&str> = args[1].split(',').collect();
-        for start in &starts_vec {
-            for end in &ends_vec {
-                grind_matches.push(GrindMatch {
-                    starts: if ignore_case {
-                        start.to_lowercase()
-                    } else {
-                        start.to_string()
-                    },
-                    ends: if ignore_case {
-                        end.to_lowercase()
-                    } else {
-                        end.to_string()
-                    },
-                    count: AtomicU64::new(args[2].parse::<u64>().unwrap()),
-                });
-            }
-        }
+        let prefixes: HashSet<String> = if ignore_case {
+            args[0]
+                .split(',')
+                .map(|s| s.to_lowercase())
+                .collect()
+        } else {
+            args[0].split(',').map(String::from).collect()
+        };
+        let suffixes: HashSet<String> = if ignore_case {
+            args[1]
+                .split(',')
+                .map(|s| s.to_lowercase())
+                .collect()
+        } else {
+            args[1].split(',').map(String::from).collect()
+        };
+        grind_matches.push(GrindMatch {
+            starts: prefixes,
+            ends: suffixes,
+            count: AtomicU64::new(args[2].parse::<u64>().unwrap()),
+        });
     }
     grind_print_info(&grind_matches, num_threads);
     grind_matches
@@ -269,7 +273,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .value_name("KEYPAIR")
                         .takes_value(true)
                         .help("Filepath or URL to a keypair"),
-                ),
+                )
         )
         .subcommand(
             Command::new("new")
@@ -301,7 +305,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                 .key_generation_common_args()
                 .arg(no_outfile_arg()
                     .conflicts_with_all(&["outfile", "silent"])
-                ),
+                )
         )
         .subcommand(
             Command::new("grind")
@@ -337,13 +341,13 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                 .arg(
                     Arg::new("starts_and_ends_with")
                         .long("starts-and-ends-with")
-                        .value_name("PREFIX,SUFFIX:COUNT")
+                        .value_name("PREFIX:SUFFIX:COUNT")
                         .number_of_values(1)
                         .takes_value(true)
                         .multiple_occurrences(true)
                         .multiple_values(true)
                         .validator(grind_validator_starts_and_ends_with)
-                        .help("Saves specified number of keypairs whos public key starts and ends with the indicated perfix and suffix\nExample: --starts-and-ends-with BO,B0:E,3:4\nPREFIX and SUFFIX type is Base58\nCOUNT type is u64"),
+                        .help("Saves specified number of keypairs whos public key starts and ends with the indicated perfix and suffix\nExample: --starts-and-ends-with sol:ana:4\nPREFIX and SUFFIX type is Base58\nCOUNT type is u64"),
                 )
                 .arg(
                     Arg::new("num_threads")
@@ -369,7 +373,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                     // Require a seed phrase to avoid generating a keypair
                     // but having no way to get the private key
                     .requires("use_mnemonic")
-                ),
+                )
         )
         .subcommand(
             Command::new("pubkey")
@@ -400,7 +404,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .short('f')
                         .long("force")
                         .help("Overwrite the output file if it exists"),
-                ),
+                )
         )
         .subcommand(
             Command::new("recover")
@@ -433,6 +437,7 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                         .long(SKIP_SEED_PHRASE_VALIDATION_ARG.long)
                         .help(SKIP_SEED_PHRASE_VALIDATION_ARG.help),
                 ),
+
         )
 }
 
@@ -615,9 +620,9 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                 .iter()
                 .map(|g| {
                     let target_key = if ignore_case {
-                        g.starts.to_ascii_uppercase()
+                        g.starts.iter().cloned().collect::<Vec<String>>()[0].to_ascii_uppercase()
                     } else {
-                        g.starts.clone()
+                        g.starts.iter().cloned().collect::<Vec<String>>()[0]
                     };
                     let target_key =
                         target_key + &(0..44 - g.starts.len()).map(|_| "1").collect::<String>();
@@ -682,14 +687,14 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                             }
                             if (!grind_matches_thread_safe[i].starts.is_empty()
                                 && grind_matches_thread_safe[i].ends.is_empty()
-                                && pubkey.starts_with(&grind_matches_thread_safe[i].starts))
+                                && grind_matches_thread_safe[i].starts.iter().any(|start| pubkey.starts_with(start)))
                                 || (grind_matches_thread_safe[i].starts.is_empty()
                                     && !grind_matches_thread_safe[i].ends.is_empty()
-                                    && pubkey.ends_with(&grind_matches_thread_safe[i].ends))
+                                    && grind_matches_thread_safe[i].ends.iter().any(|end| pubkey.ends_with(end)))
                                 || (!grind_matches_thread_safe[i].starts.is_empty()
                                     && !grind_matches_thread_safe[i].ends.is_empty()
-                                    && pubkey.starts_with(&grind_matches_thread_safe[i].starts)
-                                    && pubkey.ends_with(&grind_matches_thread_safe[i].ends))
+                                    && grind_matches_thread_safe[i].starts.iter().any(|start| pubkey.starts_with(start))
+                                    && grind_matches_thread_safe[i].ends.iter().any(|end| pubkey.ends_with(end)))
                             {
                                 let _found = found.fetch_add(1, Ordering::Relaxed);
                                 grind_matches_thread_safe[i]
